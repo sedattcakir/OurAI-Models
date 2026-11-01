@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch checkpoints and model files
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.bin
+*.onnx
+
+# Training data (large files)
+OurLLM/datasets/raw/
+OurLLM/datasets/*.txt
+OurLLM/datasets/*.json
+!OurLLM/datasets/README.md
+
+# Logs
+*.log
+logs/
+wandb/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+.env
+*.key
+
+# Temporary files
+tmp/
+temp/
