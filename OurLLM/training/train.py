@@ -1,8 +1,10 @@
 """
 Training loop for OurLLM.
 Trains the decoder-only Transformer with causal language modeling.
+Supports cosine LR schedule, train/eval split, and perplexity tracking.
 """
 import sys
+import math
 import time
 import yaml
 import torch
@@ -17,22 +19,15 @@ from OurLLM.tokenizer.bpe_tokenizer import OurBPETokenizer, PAD_ID, BOS_ID, EOS_
 
 
 class TextDataset(Dataset):
-    def __init__(self, file_path: str, tokenizer: OurBPETokenizer, max_length: int = 512):
+    def __init__(self, texts: list[str], tokenizer: OurBPETokenizer, max_length: int = 512):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = []
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-
-        for line in lines:
+        for line in texts:
             ids = tokenizer.encode(line, add_special_tokens=True)
-            if len(ids) <= max_length:
+            if 4 <= len(ids) <= max_length:
                 self.samples.append(ids)
-
-        print(f"Loaded {len(self.samples)} samples from {file_path}")
 
     def __len__(self):
         return len(self.samples)
@@ -58,6 +53,47 @@ def collate_fn(batch):
     return padded_inputs, padded_targets
 
 
+def load_texts(data_dir: Path) -> list[str]:
+    all_texts = []
+    for f in sorted(data_dir.glob("*.txt")):
+        with open(f, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    all_texts.append(line)
+    return all_texts
+
+
+def get_cosine_lr(step: int, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
+    if step < warmup_steps:
+        return max_lr * step / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(max_steps - warmup_steps, 1)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+@torch.no_grad()
+def evaluate(model, eval_loader, loss_fn, device, use_amp):
+    model.eval()
+    total_loss = 0
+    total_tokens = 0
+    for input_ids, target_ids in eval_loader:
+        input_ids = input_ids.to(device)
+        target_ids = target_ids.to(device)
+        if use_amp:
+            with torch.amp.autocast("cuda"):
+                logits = model(input_ids)
+                loss = loss_fn(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+        else:
+            logits = model(input_ids)
+            loss = loss_fn(logits.view(-1, logits.size(-1)), target_ids.view(-1))
+        num_tokens = (target_ids != -100).sum().item()
+        total_loss += loss.item() * num_tokens
+        total_tokens += num_tokens
+    model.train()
+    avg_loss = total_loss / max(total_tokens, 1)
+    return avg_loss, math.exp(avg_loss)
+
+
 def train():
     project_root = Path(__file__).parent.parent.parent
     config_path = project_root / "configs" / "ourllm_config.yaml"
@@ -78,17 +114,38 @@ def train():
     tokenizer.load(str(tokenizer_path))
 
     data_dir = project_root / "OurLLM" / "datasets" / "raw"
-    train_files = list(data_dir.glob("*.txt"))
-    if not train_files:
+    all_texts = load_texts(data_dir)
+    if not all_texts:
         print("No training data found. Run prepare_data.py first.")
         return
 
-    dataset = TextDataset(str(train_files[0]), tokenizer, config["data"]["max_length"])
+    import random
+    random.seed(42)
+    random.shuffle(all_texts)
 
-    dataloader = DataLoader(
-        dataset,
+    split_idx = int(len(all_texts) * config["data"]["train_split"])
+    train_texts = all_texts[:split_idx]
+    eval_texts = all_texts[split_idx:]
+
+    print(f"Total lines: {len(all_texts)}, Train: {len(train_texts)}, Eval: {len(eval_texts)}")
+
+    train_dataset = TextDataset(train_texts, tokenizer, config["data"]["max_length"])
+    eval_dataset = TextDataset(eval_texts, tokenizer, config["data"]["max_length"])
+
+    print(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,
+    )
+
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=0,
     )
@@ -124,19 +181,29 @@ def train():
     max_steps = config["training"]["max_steps"]
     log_interval = config["training"]["log_interval"]
     checkpoint_interval = config["training"]["checkpoint_interval"]
+    eval_interval = config["training"]["eval_interval"]
+    warmup_steps = config["training"]["warmup_steps"]
+    max_lr = config["training"]["learning_rate"]
+    min_lr = config["training"].get("min_lr", 1e-5)
 
     model.train()
     global_step = 0
     total_loss = 0
+    best_eval_loss = float("inf")
     start_time = time.time()
 
     print(f"\nStarting training for {max_steps} steps...")
     print(f"Batch size: {config['training']['batch_size']}, "
           f"Grad accum: {grad_accum_steps}, "
           f"Effective batch: {config['training']['batch_size'] * grad_accum_steps}")
+    print(f"LR schedule: cosine, warmup={warmup_steps}, max_lr={max_lr}, min_lr={min_lr}")
 
     while global_step < max_steps:
-        for batch_idx, (input_ids, target_ids) in enumerate(dataloader):
+        for batch_idx, (input_ids, target_ids) in enumerate(train_loader):
+            lr = get_cosine_lr(global_step, warmup_steps, max_steps, max_lr, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
             input_ids = input_ids.to(device)
             target_ids = target_ids.to(device)
 
@@ -173,10 +240,27 @@ def train():
                 avg_loss = total_loss / log_interval
                 elapsed = time.time() - start_time
                 steps_per_sec = global_step / elapsed
-                print(f"Step {global_step}/{max_steps} | Loss: {avg_loss:.4f} | "
-                      f"Speed: {steps_per_sec:.1f} steps/s | "
-                      f"Time: {elapsed:.0f}s")
+                ppl = math.exp(min(avg_loss, 20))
+                print(f"Step {global_step}/{max_steps} | Loss: {avg_loss:.4f} | PPL: {ppl:.1f} | "
+                      f"LR: {lr:.2e} | Speed: {steps_per_sec:.1f} steps/s | Time: {elapsed:.0f}s")
                 total_loss = 0
+
+            if global_step > 0 and global_step % eval_interval == 0 and (batch_idx + 1) % grad_accum_steps == 0:
+                eval_loss, eval_ppl = evaluate(model, eval_loader, loss_fn, device, use_amp)
+                print(f"  [Eval] Loss: {eval_loss:.4f} | Perplexity: {eval_ppl:.1f}")
+                if eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    best_path = checkpoint_dir / "ourllm_best.pt"
+                    torch.save({
+                        "step": global_step,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "config": config,
+                        "eval_loss": eval_loss,
+                        "eval_ppl": eval_ppl,
+                    }, str(best_path))
+                    print(f"  New best model saved! (loss={eval_loss:.4f})")
+                model.train()
 
             if global_step > 0 and global_step % checkpoint_interval == 0 and (batch_idx + 1) % grad_accum_steps == 0:
                 ckpt_path = checkpoint_dir / f"ourllm_step_{global_step}.pt"
@@ -198,8 +282,14 @@ def train():
         "optimizer_state_dict": optimizer.state_dict(),
         "config": config,
     }, str(final_path))
-    print(f"\nTraining complete! Final checkpoint: {final_path}")
-    print(f"Total time: {time.time() - start_time:.0f}s")
+
+    eval_loss, eval_ppl = evaluate(model, eval_loader, loss_fn, device, use_amp)
+    total_time = time.time() - start_time
+    print(f"\nTraining complete!")
+    print(f"Final checkpoint: {final_path}")
+    print(f"Best eval loss: {best_eval_loss:.4f}")
+    print(f"Final eval loss: {eval_loss:.4f} | Perplexity: {eval_ppl:.1f}")
+    print(f"Total time: {total_time:.0f}s ({total_time/60:.1f} min)")
 
 
 if __name__ == "__main__":

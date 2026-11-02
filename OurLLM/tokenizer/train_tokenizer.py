@@ -11,16 +11,18 @@ def main():
     data_dir = Path(__file__).parent.parent / "datasets" / "raw"
     tokenizer_dir = Path(__file__).parent / "trained"
 
-    train_files = list(data_dir.glob("*.txt"))
+    train_files = sorted(data_dir.glob("*.txt"))
     if not train_files:
         print(f"No training files found in {data_dir}")
         print("Run prepare_data.py first:")
         print("  python OurLLM/datasets/prepare_data.py")
         return
 
+    total_size = sum(f.stat().st_size for f in train_files)
     print(f"Training files: {[f.name for f in train_files]}")
+    print(f"Total data size: {total_size / 1024 / 1024:.1f} MB")
 
-    tokenizer = OurBPETokenizer(vocab_size=8000)
+    tokenizer = OurBPETokenizer(vocab_size=16000)
     tokenizer.train([str(f) for f in train_files], min_frequency=2)
 
     save_path = str(tokenizer_dir / "ourllm_tokenizer.json")

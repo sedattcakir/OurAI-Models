@@ -68,7 +68,12 @@ def main():
     print(f"Device: {device}")
 
     project_root = Path(__file__).parent.parent.parent
-    checkpoint_path = project_root / "checkpoints" / "ourllm_final.pt"
+
+    use_best = "--best" in sys.argv
+    if use_best:
+        checkpoint_path = project_root / "checkpoints" / "ourllm_best.pt"
+    else:
+        checkpoint_path = project_root / "checkpoints" / "ourllm_final.pt"
 
     if not checkpoint_path.exists():
         print(f"No checkpoint found at {checkpoint_path}")
